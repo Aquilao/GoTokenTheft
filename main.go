@@ -141,7 +141,7 @@ func main() {
 	flag.StringVar(&command, "c", "Aquilao", "Execute Command.")
 	flag.Parse()
 
-	if pid != 0 && command != "Aquilao" {
+	if pid != 0 && command != "." {
 		log.Println("[+] Process Pid: ", pid)
 		log.Println("[+] Execute Command: ", command)
 		enableSeDebugPrivilege()
