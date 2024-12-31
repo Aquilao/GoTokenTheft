@@ -406,46 +406,6 @@ func runAsToken(TokenHandle uintptr, command *uint16) error {
 	return err
 }
 
-func listProcesses() {
-	snapshot, err := syscall.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-	if err != nil {
-		log.Printf("[-] Failed to create snapshot: %v\n", err)
-		return
-	}
-	defer syscall.CloseHandle(snapshot)
-
-	var pe syscall.ProcessEntry32
-	pe.Size = uint32(unsafe.Sizeof(pe))
-
-	err = syscall.Process32First(snapshot, &pe)
-	if err != nil {
-		log.Printf("[-] Failed to get first process: %v\n", err)
-		return
-	}
-
-	log.Println("[+] PID\tUser\t\t\tProcess Name")
-	log.Println(" ===\t====\t\t\t============")
-
-	for {
-		handle, err := syscall.OpenProcess(PROCESS_QUERY_INFORMATION, false, pe.ProcessID)
-		if err == nil {
-			var token syscall.Token
-			err = syscall.OpenProcessToken(handle, TOKEN_QUERY, &token)
-			if err == nil {
-				userName := getTokenUserInfo(token)
-				fmt.Printf("\t\t\t%d\t%-40s\t%s\n", pe.ProcessID, userName, syscall.UTF16ToString(pe.ExeFile[:]))
-				token.Close()
-			}
-			syscall.CloseHandle(handle)
-		}
-
-		err = syscall.Process32Next(snapshot, &pe)
-		if err != nil {
-			break
-		}
-	}
-}
-
 func main() {
 	username, isElevated := getUserInfo()
 	if isElevated {
@@ -458,15 +418,11 @@ func main() {
 	var pid int
 	var command string
 	var list bool
-<<<<<<< HEAD
 	var tokens bool
-=======
->>>>>>> 5841cc7 (feat: add -l to list process info)
 
 	flag.IntVar(&pid, "p", 0, "Target Process PID.")
 	flag.StringVar(&command, "c", "Aquilao", "Execute Command.")
 	flag.BoolVar(&list, "l", false, "List all processes with their tokens")
-<<<<<<< HEAD
 	flag.BoolVar(&tokens, "t", false, "List available unique tokens in system")
 	flag.Parse()
 
@@ -475,10 +431,8 @@ func main() {
 		return
 	}
 
-=======
 	flag.Parse()
 
->>>>>>> 5841cc7 (feat: add -l to list process info)
 	if list {
 		listProcesses()
 		return
