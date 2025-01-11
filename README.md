@@ -4,7 +4,7 @@ Go 编写的 Token 窃取工具，用于后渗透时在目标机器上使用不�
 
 > [!IMPORTANT]
 >
-> Token 窃取的前提是需要启用 `SeDebugPrivilege`，在大多数后渗透场景下是 `NT AUTHORITY\SYSTEM` 权限或者 `bypass UAC`之后的人类用户权限
+> Token 窃取的前提是需要启用 `SeDebugPrivilege`，在大多数后渗透场景下是 `NT AUTHORITY\SYSTEM` 权限或者 `bypass UAC`之后的人类用户权限，比如`Administrator`
 
 
 
