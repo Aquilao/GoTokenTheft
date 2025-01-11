@@ -28,6 +28,8 @@ GOOS=windows GOARCH=386 CC="i686-w64-mingw32-gcc" go build -o GoTokenTheft.exe m
 
 ### 快速上手
 
+指定进程
+
 Usage:
 ```
 GoTokenTheft.exe -p <pid> -c <command>
@@ -36,6 +38,20 @@ GoTokenTheft.exe -p <pid> -c <command>
 e.g.
 ```
 GoTokenTheft.exe -p 114514 -c cmd.exe
+```
+
+指定用户
+
+Usage:
+
+```
+GoTokenTheft.exe -u <user> -c <command>
+```
+
+e.g.
+
+```
+GoTokenTheft.exe -u "NT AUTHORITY\SYSTEM" -c cmd.exe
 ```
 
 
