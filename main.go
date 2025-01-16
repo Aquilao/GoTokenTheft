@@ -12,6 +12,15 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+const banner = `
+   ______    ______      __            ________         ______ 
+  / ____/___/_  __/___  / /_____  ____/_  __/ /_  ___  / __/ /_
+ / / __/ __ \/ / / __ \/ //_/ _ \/ __ \/ / / __ \/ _ \/ /_/ __/
+/ /_/ / /_/ / / / /_/ / ,< /  __/ / / / / / / / /  __/ __/ /_  
+\____/\____/_/  \____/_/|_|\___/_/ /_/_/ /_/ /_/\___/_/  \__/  
+                                                               
+`
+
 // References: https://stackoverflow.com/questions/39595252/shutting-down-windows-using-golang-code
 type Luid struct {
 	lowPart  uint32 // DWORD
@@ -84,6 +93,10 @@ var (
 	modadvapi32                 = windows.NewLazySystemDLL("advapi32.dll")
 	procCreateProcessWithTokenW = modadvapi32.NewProc("CreateProcessWithTokenW")
 )
+
+func printBanner() {
+	fmt.Println(banner)
+}
 
 func createProcessWithTokenW(token windows.Token, logonFlags uint32, appName, cmdLine *uint16, creFlags uint32,
 	env *uint16, curDir *uint16, si *windows.StartupInfo, pi *windows.ProcessInformation) error {
@@ -465,6 +478,7 @@ func tryDuplicateTokenForAllRealUsers(command string) {
 }
 
 func main() {
+	printBanner()
 	username, isElevated := getUserInfo()
 	if isElevated {
 		log.Printf("[+] Current user: %s (UAC bypassed)", username)
